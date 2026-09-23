@@ -93,6 +93,17 @@
     <section class="panel" id="panel-detect-upload">
       <h2><span class="num">③</span> 独立检测（可选）</h2>
       <p class="muted">上传任意图片（含水印图、截图、JPEG 转发件等）直接检测，无需先嵌入。</p>
+      <div class="field">
+        <span>检测模式</span>
+        <div class="seg" id="detect-mode-seg">
+          <button type="button" data-value="normal" class="on">普通检测</button>
+          <button type="button" data-value="orient">自动方向检索</button>
+        </div>
+        <small class="muted">
+          自动方向检索会对原向、90/180/270° 及水平镜像后的四个方向逐一检测，
+          仅采信通过载荷校验的方向。
+        </small>
+      </div>
       <label class="field">
         <span>待检测图片</span>
         <input type="file" id="detect-file" accept="image/png,image/jpeg,image/webp,image/bmp" />
@@ -174,6 +185,15 @@
         <code id="detect-text">—</code>
       </div>
 
+      <div id="orientation-box" class="orientation-box hidden">
+        <div class="orient-head">
+          <span class="chip" id="orient-chosen">—</span>
+          <span id="orient-valid" class="muted"></span>
+        </div>
+        <div id="orient-conflict" class="orient-conflict hidden"></div>
+        <div id="orient-candidates" class="orient-cands"></div>
+      </div>
+
       <h3>置信度</h3>
       <div class="gauge">
         <div class="gauge-row">
@@ -200,6 +220,7 @@
         <dt>同步块 / 载荷块</dt><dd id="r-blocks">—</dd>
         <dt>每比特投票数</dt><dd id="r-votes">—</dd>
         <dt>疑似失真块</dt><dd id="r-marked">—</dd>
+        <dt id="r-orient-dt">入选方向</dt><dd id="r-orient">—</dd>
       </dl>
 
       <button class="ghost" id="btn-download-marked">⬇ 下载失真标注 PNG</button>

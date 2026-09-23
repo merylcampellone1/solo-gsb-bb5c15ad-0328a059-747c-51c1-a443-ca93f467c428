@@ -14,6 +14,7 @@ const api = async (url, opts = {}) => {
 const state = {
   jobId: null,
   strength: "medium",
+  detectMode: "normal",    // normal | orient（独立检测）
   originalUrl: null,
   watermarkedUrl: null,
   targetUrl: null,
@@ -155,25 +156,49 @@ $("#btn-detect-attacked").addEventListener("click", () =>
 
 /* ---------------- 独立检测 ---------------- */
 
+$("#detect-mode-seg").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-value]");
+  if (!btn) return;
+  state.detectMode = btn.dataset.value;
+  document.querySelectorAll("#detect-mode-seg button").forEach((b) =>
+    b.classList.toggle("on", b === btn)
+  );
+});
+
 $("#btn-detect-upload").addEventListener("click", async () => {
   const file = $("#detect-file").files[0];
   const status = $("#detect-upload-status");
   if (!file) return fail(status, "请先选择待检测图片。");
-  await runDetect(file, null, "upload", status);
+  await runDetect(file, null, "upload", status,
+    state.detectMode === "orient" ? "1" : "0");
 });
 
 /* ---------------- 检测核心 ---------------- */
 
-async function runDetect(file, jobId, source, statusEl) {
+async function runDetect(file, jobId, source, statusEl, autoOrient = "0") {
   const status = statusEl || $("#attack-status");
-  busy(status, "正在执行 64 相移同步搜索与多数表决…");
+  busy(status, autoOrient === "1"
+    ? "正在 8 个方向上逐一执行同步搜索与多数表决…"
+    : "正在执行 64 相移同步搜索与多数表决…");
   const fd = new FormData();
   if (file) fd.append("image", file);
   if (jobId) fd.append("job_id", jobId);
+  fd.append("auto_orient", autoOrient);
   try {
     const r = await api("/api/detect", { method: "POST", body: fd });
     renderResult(r, source);
-    ok(status, r.detected ? "检测完成，水印已恢复。" : "检测完成，但未能恢复水印。");
+    if (r.orientation_search) {
+      const os = r.orientation_search;
+      if (!r.detected) {
+        ok(status, `方向检索完成：${os.orientations_tried} 个方向均未通过载荷校验，未能恢复水印。`);
+      } else if (os.conflict) {
+        ok(status, `检测完成，但有效方向恢复出 ${os.conflict_texts.length} 种不同文本，存在冲突，请查看候选。`);
+      } else {
+        ok(status, `检测完成，水印方向「${os.chosen_label}」已恢复。`);
+      }
+    } else {
+      ok(status, r.detected ? "检测完成，水印已恢复。" : "检测完成，但未能恢复水印。");
+    }
   } catch (err) {
     fail(status, err.message);
   }
@@ -218,6 +243,8 @@ function renderResult(r, source) {
   $("#r-marked").textContent =
     `${m.marked_blocks} / ${m.total_blocks} 块（${(m.marked_fraction * 100).toFixed(1)}%）`;
 
+  renderOrientation(r.orientation_search, r.detected);
+
   if (r.marked_url) {
     state.markedUrl = `${r.marked_url}?t=${Date.now()}`;
     showImage("marked", state.markedUrl);
@@ -226,6 +253,61 @@ function renderResult(r, source) {
   }
 
   recordDetection(r);
+}
+
+/* ---------------- 自动方向检索结果 ---------------- */
+
+function renderOrientation(os, detected) {
+  const box = $("#orientation-box");
+  const rowDt = $("#r-orient-dt");
+  const rowDd = $("#r-orient");
+  if (!os) {
+    box.classList.add("hidden");
+    rowDt.style.display = "none";
+    rowDd.style.display = "none";
+    return;
+  }
+  box.classList.remove("hidden");
+  rowDt.style.display = "";
+  rowDd.style.display = "";
+
+  const chosen = os.chosen_index != null
+    ? os.candidates[os.chosen_index] : null;
+  $("#orient-chosen").textContent = chosen
+    ? `入选方向：${chosen.label} · ${chosen.confidence}%`
+    : "无有效方向";
+  $("#r-orient").textContent = chosen ? chosen.label : "—（未通过载荷校验）";
+  $("#orient-valid").textContent =
+    `${os.valid_candidate_count} / ${os.orientations_tried} 个方向通过载荷校验`;
+
+  const conflict = $("#orient-conflict");
+  if (os.conflict) {
+    conflict.classList.remove("hidden");
+    conflict.innerHTML =
+      "⚠ 有效方向恢复出不同文本（冲突），最佳候选并非唯一结论：" +
+      os.conflict_texts.map((t) => `<code>${escapeHtml(t)}</code>`).join("、");
+  } else {
+    conflict.classList.add("hidden");
+    conflict.textContent = "";
+  }
+
+  const box2 = $("#orient-candidates");
+  box2.innerHTML = "";
+  os.candidates.forEach((c) => {
+    const row = document.createElement("div");
+    row.className = "orient-cand" + (c.detected ? " valid" : " invalid")
+      + (c.index === os.chosen_index ? " chosen" : "");
+    const mark = c.index === os.chosen_index ? "★ " : "";
+    const body = c.detected
+      ? `<b>${mark}${escapeHtml(c.label)}</b>
+         <code>${escapeHtml(c.text)}</code>
+         <span>${c.confidence}% · 同步 ${Math.abs(c.sync_score).toFixed(3)}</span>`
+      : `<b>${mark}${escapeHtml(c.label)}</b>
+         <span class="muted">未通过载荷校验 · 同步 ${Math.abs(c.sync_score).toFixed(3)}</span>`;
+    row.innerHTML = body;
+    row.title = c.detected ? "" : c.reason || "";
+    box2.appendChild(row);
+  });
 }
 
 /* ---------------- 检测报告归档 ---------------- */
@@ -253,6 +335,12 @@ function recordDetection(r) {
     confidence: r.metrics.confidence,
     at: r.detected_at_iso || r.detected_at,
     marked_det_url: r.marked_det_url,
+    orientation_label:
+      r.orientation_search && r.orientation_search.chosen_index != null
+        ? r.orientation_search.chosen_label
+        : null,
+    orientation_conflict:
+      !!(r.orientation_search && r.orientation_search.conflict),
     checked: true,
   });
   renderDetectList();
@@ -268,6 +356,9 @@ function renderDetectList() {
       const label = document.createElement("label");
       label.className = "detect-item";
       const time = String(d.at || "").replace("T", " ").replace("Z", " UTC");
+      const orient = d.orientation_label
+        ? ` · 方向：${escapeHtml(d.orientation_label)}${d.orientation_conflict ? " ⚠冲突" : ""}`
+        : "";
       label.innerHTML = `
         <input type="checkbox" ${d.checked ? "checked" : ""} data-i="${i}" />
         <span class="det-badge ${d.detected ? "ok" : "fail"}">
@@ -275,7 +366,7 @@ function renderDetectList() {
         </span>
         <span class="det-main">
           <b>${escapeHtml(d.detected ? d.text : "未恢复水印")}</b>
-          <small>${SOURCE_LABELS[d.source] || d.source} · 置信度 ${d.confidence ?? "—"}% · ${escapeHtml(time)}</small>
+          <small>${SOURCE_LABELS[d.source] || d.source} · 置信度 ${d.confidence ?? "—"}%${orient} · ${escapeHtml(time)}</small>
         </span>`;
       box.appendChild(label);
     });

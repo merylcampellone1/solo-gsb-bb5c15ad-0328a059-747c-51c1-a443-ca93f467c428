@@ -61,6 +61,29 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 此外，「独立检测」区支持直接上传任意图片（含水印图、JPEG 转发件、截图等）进行盲检测。
 
+### 独立检测的自动方向检索（可选）
+
+当待检测图在传播中被**旋转或镜像**（例如手机竖拍横存、社交平台翻转）时，普通检测的
+同步网格对不上方向，会判定为无水印。在「独立检测」区把检测模式切到
+**「自动方向检索」**，系统会对上传图按**固定顺序枚举 8 个方向**——
+原向、顺时针 90° / 180° / 270°，以及**水平镜像**后的同样四个方向——
+在每个方向上各运行一次与普通检测完全相同的现有水印检测：
+
+- **仅把通过载荷校验**（魔数 0xAB + 长度 + 字节校验和同时通过）的方向记为**有效候选**，
+  同步相关峰高但文本校验失败的方向不算数；
+- 有效候选按**置信度**取最佳；置信度相同时按固定枚举顺序
+  （原向 → 90° → 180° → 270° → 镜像 → 镜像 90° → 镜像 180° → 镜像 270°）取靠前者；
+- 若多个有效候选恢复出**不同文本**，结果会标记 **⚠ 冲突**并列出所有候选文本，
+  最佳候选不会被当成唯一结论，需要人工甄别；
+- 入选方向的**失真标注图**在该方向坐标系内生成后，会经**逆变换映射回上传图坐标**
+  （旋转导致的高 / 宽互换也会还原），可直接与上传图叠看；而
+  **检测输入快照始终是未经几何变换的原始上传图**；
+- 方向、入选方向、有效候选数、冲突标志与全部 8 个方向的候选摘要都会写入
+  **检测记录**并随报告归档（`detections[*].orientation_search`）。
+
+模式为**可选**：「普通检测」仍只跑原向一次，行为与之前完全一致；引用任务图片的检测
+（① 嵌入 → ② 攻击 → ③ 检测流程）不受 `auto_orient` 影响，始终走原流程。
+
 ### 图片隐私检查（EXIF，只读）
 
 页面最下方的「**图片隐私检查（EXIF）**」区支持上传一张 **PNG / JPEG** 照片，解析其 EXIF 中的：
@@ -218,7 +241,7 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/health` | 健康检查 |
 | POST | `/api/embed` | multipart：`image`(图片)、`text`、`strength`(low/medium/high)，返回任务 ID 与嵌入指标 |
 | POST | `/api/attack` | JSON：`{job_id, jpeg_quality?, crop_fraction?}`，生成受攻击待测图 |
-| POST | `/api/detect` | multipart：上传 `image` **或**传 `job_id`，返回文本、置信度、指标、检测记录 ID 与标注图 URL |
+| POST | `/api/detect` | multipart：上传 `image` **或**传 `job_id`，返回文本、置信度、指标、检测记录 ID 与标注图 URL；独立上传可加 `auto_orient=true` 启用 8 方向自动检索（原向 / 90 / 180 / 270° + 水平镜像四方向），响应附带 `orientation_search`（入选方向、候选摘要、冲突），入选方向标注图已逆变换回上传图坐标 |
 | POST | `/api/privacy-check` | multipart：上传 PNG/JPEG `image`，**只读**解析 EXIF 拍摄时间、相机品牌/型号、GPS（带符号十进制度）；不落盘、不建任务，字段缺失为 `null`，EXIF 损坏返回 200 + `warnings` |
 | GET | `/api/jobs/{id}/{kind}` | 下载 `original` / `watermarked` / `target` / `marked` PNG |
 | GET | `/api/jobs/{id}/detections/{det_id}/{kind}` | 下载某次检测的 `source`（检测输入快照）/ `marked`（标注图）PNG |
@@ -247,6 +270,36 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
   "marked_url": "/api/jobs/.../marked"
 }
 ```
+
+启用自动方向检索时（`auto_orient=true`），检测响应与检测记录额外包含
+`orientation_search`：
+
+```json
+{
+  "detected": true,
+  "text": "机密-2026",
+  "orientation_search": {
+    "orientations_tried": 8,
+    "chosen_index": 3,
+    "chosen_orientation": "rot270cw",
+    "chosen_label": "逆时针旋转 90°（顺时针 270°）",
+    "valid_candidate_count": 1,
+    "valid_indices": [3],
+    "conflict": false,
+    "conflict_texts": [],
+    "candidates": [
+      { "index": 0, "orientation": "original", "detected": false,
+        "confidence": 0.0, "sync_score": 0.1 },
+      { "index": 3, "orientation": "rot270cw", "detected": true,
+        "text": "机密-2026", "confidence": 98.7, "sync_score": 0.998 }
+    ]
+  }
+}
+```
+
+> `conflict=true` 时 `conflict_texts` 列出有效候选恢复出的互不相同文本；
+> 此时顶层 `text` 只是置信度最高候选的结果，不应作为唯一结论。
+> 普通检测（不带 `auto_orient` 或 `false`）响应中 `orientation_search` 为 `null`。
 
 隐私检查响应（节选；缺失字段为 `null`，前端显示「无」）：
 
@@ -311,6 +364,7 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 .
 ├── app/
 │   ├── dctwm.py          # 核心算法：DCT 嵌入 / PN 同步 / 相移搜索 / 多数表决 / 失真标注
+│   ├── orientation.py    # 独立上传可选：8 方向（旋转 + 水平镜像）自动检索 / 载荷校验取舍 / 标注图逆变换
 │   ├── exifcheck.py      # 图片隐私检查：只读解析 EXIF 拍摄时间 / 相机 / GPS（损坏不阻断、不落盘）
 │   ├── archive.py        # 检测报告：规范化 JSON / SHA-256 清单 / 仅追加哈希链归档 / 校验
 │   ├── main.py           # FastAPI：任务存储、嵌入/攻击/检测/隐私检查/报告接口、静态资源
@@ -320,6 +374,7 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 │       └── app.js
 ├── tests/
 │   ├── test_core.py      # 核心算法数值验证（DCT/PN/鲁棒性全链路）
+│   ├── test_orientation.py # 自动方向检索：8 向枚举 / 同分取舍 / 冲突 / 逆变换 / 归档
 │   ├── test_privacy.py   # 隐私检查接口：EXIF 解析 / DMS 还原 / 缺失与损坏 / 不落盘不阻断
 │   └── test_reports.py   # 报告归档接口与清单/哈希链校验（篡改、缺失、断链）
 ├── requirements.txt
@@ -332,7 +387,7 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 
 ```bash
 python3 tests/test_core.py
-python3 -m pytest tests/test_reports.py tests/test_privacy.py -q   # 归档 + 隐私检查接口测试
+python3 -m pytest tests/ -q   # 归档 + 隐私检查 + 方向检索接口测试
 ```
 
 数据目录布局（`WM_DATA_DIR`）：
@@ -342,9 +397,9 @@ python3 -m pytest tests/test_reports.py tests/test_privacy.py -q   # 归档 + �
 ├── meta.json                         # 嵌入参数（独立上传检测时为 upload_only 轻量元数据）
 ├── original.png / watermarked.png / target.png / marked.png
 └── detections/
-    ├── det_xxxxxxxxxxxx.json         # 检测记录（文本/置信度/指标/攻击参数快照）
-    ├── det_xxxxxxxxxxxx.source.png   # 该次检测输入快照
-    └── det_xxxxxxxxxxxx.png          # 该次检测失真标注图
+    ├── det_xxxxxxxxxxxx.json         # 检测记录（文本/置信度/指标/攻击参数；自动方向检索时含 orientation_search 方向与候选摘要）
+    ├── det_xxxxxxxxxxxx.source.png   # 该次检测输入快照（自动方向检索时始终是未经几何变换的原始上传图）
+    └── det_xxxxxxxxxxxx.png          # 该次检测失真标注图（自动方向检索时已逆变换回上传图坐标）
 reports/rep_xxxxxxxxxxxx/report.json  # 规范化报告（含 SHA-256 清单）
 archive.log.jsonl                     # 仅追加归档记录（哈希链）
 ```

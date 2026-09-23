@@ -4,7 +4,8 @@
   GET  /                 前端页面
   POST /api/embed        上传图片 + 文本 -> 含水印 PNG
   POST /api/attack       对任务图片施加 JPEG 重压缩 / 中心裁切
-  POST /api/detect       上传图片或引用任务图片 -> 水印检测结果 + 失真叠加图
+  POST /api/detect       上传图片或引用任务图片 -> 水印检测结果 + 失真叠加图；
+                          独立上传可选 auto_orient=true 做 8 方向自动检索
   POST /api/privacy-check  上传 PNG/JPEG -> 只读解析 EXIF 拍摄时间/相机/GPS（不落盘、不建任务）
   GET  /api/jobs/{id}/{kind}  任务文件下载（original/watermarked/target/marked）
   GET  /api/jobs/{id}/detections/{det_id}/{kind}  某次检测的输入快照 / 标注图
@@ -29,7 +30,7 @@ from PIL import Image
 from pydantic import BaseModel
 
 from . import archive, dctwm as wm
-from . import exifcheck
+from . import exifcheck, orientation
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -39,7 +40,7 @@ MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 MAX_DIM = 4096
 ALLOWED_KINDS = {"original", "watermarked", "target", "marked"}
 
-app = FastAPI(title="抗裁切水印实验台", version="1.1.0")
+app = FastAPI(title="抗裁切水印实验台", version="1.2.0")
 
 
 # ---------------------------------------------------------------- 任务存储
@@ -237,15 +238,32 @@ def attack(req: AttackRequest):
     }
 
 
+def _truthy(v: str | None) -> bool:
+    return (v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 @app.post("/api/detect")
 async def detect(
     image: UploadFile | None = File(None),
     job_id: str | None = Form(None),
+    auto_orient: str = Form("false"),
 ):
     _ensure_data_dir()
     rgb, source = _resolve_image(image, job_id, prefer="target")
+
+    # 自动方向检索仅对“独立上传”的图片有意义；引用任务图片仍按原流程。
+    use_orientation = source == "uploaded" and _truthy(auto_orient)
+    orient_summary: dict | None = None
+    chosen_spec: dict | None = None
     try:
-        res = wm.detect_watermark(rgb)
+        if use_orientation:
+            search = orientation.search_orientations(rgb)
+            orient_summary = search.summary()
+            res = search.best_result
+            if search.chosen is not None:
+                chosen_spec = search.chosen.spec
+        else:
+            res = wm.detect_watermark(rgb)
     except wm.WatermarkError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -273,18 +291,28 @@ async def detect(
     d = DATA_DIR / job_id
     marked_url = None
     has_overlay = res.overlay is not None
+    overlay = res.overlay
     if has_overlay:
-        # 兼容旧前端的“当前标注图”，同时为每次检测保存独立标注图
-        Image.fromarray(res.overlay).save(d / "marked.png", format="PNG", optimize=True)
-        marked_url = f"/api/jobs/{job_id}/marked"
+        # 自动方向检索：入选方向的标注图在该方向坐标系内生成，
+        # 逆变换回上传图坐标后再保存（检测输入快照始终是原始上传图）。
+        if use_orientation and chosen_spec is not None:
+            overlay = orientation.invert_to_original(overlay, chosen_spec)
+        if overlay.shape[:2] != rgb.shape[:2]:
+            # 几何兜底：逆变换结果必须与上传图同尺寸，否则丢弃标注图
+            has_overlay = False
+        else:
+            # 兼容旧前端的“当前标注图”，同时为每次检测保存独立标注图
+            Image.fromarray(overlay).save(d / "marked.png", format="PNG", optimize=True)
+            marked_url = f"/api/jobs/{job_id}/marked"
 
     det_dir = d / "detections"
     det_dir.mkdir(parents=True, exist_ok=True)
-    # 该次检测实际分析的图片快照（避免后续攻击覆盖 target.png）
+    # 该次检测实际分析的图片快照（避免后续攻击覆盖 target.png）；
+    # 自动方向检索时保存的始终是未经几何变换的原始上传图。
     Image.fromarray(rgb).save(det_dir / f"{detection_id}.source.png",
                               format="PNG", optimize=True)
     if has_overlay:
-        Image.fromarray(res.overlay).save(
+        Image.fromarray(overlay).save(
             det_dir / f"{detection_id}.png", format="PNG", optimize=True)
 
     metrics = {
@@ -316,6 +344,8 @@ async def detect(
         "attack_history": attack_history,
         "has_overlay": has_overlay,
     }
+    if orient_summary is not None:
+        record["orientation_search"] = orient_summary
     (det_dir / f"{detection_id}.json").write_text(
         json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -330,6 +360,7 @@ async def detect(
         "text": res.text,
         "reason": res.reason,
         "metrics": metrics,
+        "orientation_search": orient_summary,
         "marked_url": marked_url,
         "marked_det_url": (
             f"/api/jobs/{job_id}/detections/{detection_id}/marked"
