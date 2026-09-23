@@ -59,7 +59,25 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
    - 显示恢复文本、总体置信度、同步相关峰、同步块一致率与逐比特置信度；
    - 「失真标注图」用颜色标出健康/受损瓦片、判决错误块、可疑弱块，可**下载 PNG**。
 
-此外，「独立检测」区支持直接上传任意图片（含水印图、JPEG 转发件、截图等）进行盲检测。
+此外，「独立检测」区支持直接上传任意图片（含水印图、JPEG 转发件、截图等）进行盲检测，
+并提供两种模式（页面上直接切换）：
+
+- **普通检测（默认）**：仅按上传图原向执行一次检测，速度快，适合确认本台嵌入的图片；
+- **自动方向检索**：对 **8 个方向** —— 原向、顺时针 90° / 180° / 270°，以及各自的
+  **水平镜像** —— 逐一运行同一套水印检测，**仅把通过魔数 + 字节校验和载荷校验的结果
+  视作有效候选**；再按置信度选出最佳方向（**同分按原向 → 90° → 180° → 270° → 镜像系
+  的固定顺序取舍**）。
+  - 检测结果面板会列出全部 8 个候选方向的校验结果、置信度与恢复文本；
+  - 若不同有效候选**恢复出不同文本**，会明确标记「**方向候选冲突**」并列出候选文本——
+    此时最佳候选**不是唯一结论**，需要人工甄别，面板不会把它当作唯一答案；
+  - 入选方向的**失真标注图会被逆变换回上传图坐标**（即标注与上传画面逐像素对齐），
+    而检测输入快照始终保存**上传原图**，不会被转正或镜像；
+  - 方向、入选结果、冲突标记与候选摘要写入检测记录，并随检测记录一起进入
+    **规范化 JSON 报告与哈希链归档**；
+  - 耗时约为普通检测的 **8 倍**（8 次检测纯内存运行，不产生额外临时文件）。
+
+> 自动方向检索仅对「独立上传检测」开放；引用任务图片（嵌入 / 攻击流程）的检测始终
+> 按原流程执行，不受模式开关影响。
 
 ### 图片隐私检查（EXIF，只读）
 
@@ -108,6 +126,7 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
       "text": "机密-2026",
       "confidence": 100.0,
       "metrics": { "sync_score": 1.0, "sync_agreement": 1.0 },
+      "orientation_search": { "enabled": false },
       "attack_history": [ { "type": "jpeg", "quality": 65 } ],
       "references": [
         { "role": "attacked", "path": ".../det_xxx.source.png",
@@ -181,6 +200,20 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 逐块比对期望符号：同步块看 PN，载荷块看恢复码流；判决翻转块标红、
   临界弱块（|软差值| < 阈值）标黄，按瓦片聚合健康度。
 
+### 3.1 自动方向检索（独立上传检测，可选）
+
+- 对上传图生成 **8 个方向视图**（D4 二面体群）：原向、顺时针 90° / 180° / 270°，
+  以及「先水平镜像再顺时针旋转」的 4 个方向；每个视图独立运行上述完整检测，
+  **不放宽任何门限**——同步相关峰门限、魔数 `0xAB`、长度与字节校验和全部照旧，
+  因此多方向枚举不会提高无水印图的误报率。
+- 只有 `detected=True`（载荷校验通过）的方向进入候选；按总体置信度取最大，
+  同分按固定顺序（原向优先，镜像系最后）取舍。
+- 不同有效候选恢复出不同文本时标记**冲突**并去重列出候选文本；最佳候选
+  仅按规则排序产生，不被表述成唯一结论。
+- 入选方向的失真标注图做对应**逆刚体变换**（旋转 / 镜像，无重采样、无插值）
+  映射回上传图坐标；90°/270° 方向伴随宽高交换，逆变换后恢复上传图尺寸。
+  检测输入快照永远是上传原图本身。
+
 ### 4. 实测鲁棒性（合成测试图，medium 档）
 
 **A. 纹理丰富的自然纹理图**（不可见性 PSNR ≈ 33 dB）
@@ -218,7 +251,7 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/health` | 健康检查 |
 | POST | `/api/embed` | multipart：`image`(图片)、`text`、`strength`(low/medium/high)，返回任务 ID 与嵌入指标 |
 | POST | `/api/attack` | JSON：`{job_id, jpeg_quality?, crop_fraction?}`，生成受攻击待测图 |
-| POST | `/api/detect` | multipart：上传 `image` **或**传 `job_id`，返回文本、置信度、指标、检测记录 ID 与标注图 URL |
+| POST | `/api/detect` | multipart：上传 `image` **或**传 `job_id`；可选 `orientation_search=true`（仅对独立上传生效，按原向/90°/180°/270° 及各自水平镜像共 8 方向逐一检测，仅采信通过载荷校验的候选），返回文本、置信度、指标、检测记录 ID、标注图 URL 与方向候选摘要 |
 | POST | `/api/privacy-check` | multipart：上传 PNG/JPEG `image`，**只读**解析 EXIF 拍摄时间、相机品牌/型号、GPS（带符号十进制度）；不落盘、不建任务，字段缺失为 `null`，EXIF 损坏返回 200 + `warnings` |
 | GET | `/api/jobs/{id}/{kind}` | 下载 `original` / `watermarked` / `target` / `marked` PNG |
 | GET | `/api/jobs/{id}/detections/{det_id}/{kind}` | 下载某次检测的 `source`（检测输入快照）/ `marked`（标注图）PNG |
@@ -247,6 +280,45 @@ WM_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
   "marked_url": "/api/jobs/.../marked"
 }
 ```
+
+当 `orientation_search=true` 时，响应（及检测记录、报告中的每次检测）额外包含
+`orientation_search` 块；普通检测该块固定为 `{"enabled": false}`：
+
+```json
+{
+  "orientation_search": {
+    "enabled": true,
+    "selected": "rotate270",
+    "selected_label": "逆时针 90°（顺时针 270°）",
+    "detected": true,
+    "conflict": false,
+    "conflict_texts": [],
+    "candidates": [
+      { "orientation": "original",  "label": "原向",
+        "detected": false, "confidence": 0.0, "text": "",
+        "sync_score": 0.18, "sync_agreement": 0.0,
+        "reason": "未找到同步网格（相关峰值过低）…" },
+      { "orientation": "rotate90",  "label": "顺时针 90°", "detected": false, "...": "..." },
+      { "orientation": "rotate180", "label": "180°",       "detected": false, "...": "..." },
+      { "orientation": "rotate270", "label": "逆时针 90°（顺时针 270°）",
+        "detected": true, "confidence": 100.0, "text": "机密-2026",
+        "sync_score": 1.0, "sync_agreement": 1.0 },
+      { "orientation": "mirror", "detected": false, "...": "..." },
+      { "orientation": "mirror90", "detected": false, "...": "..." },
+      { "orientation": "mirror180", "detected": false, "...": "..." },
+      { "orientation": "mirror270", "detected": false, "...": "..." }
+    ]
+  }
+}
+```
+
+> - 候选方向固定顺序：`original` → `rotate90` → `rotate180` → `rotate270`
+>   → `mirror` → `mirror90` → `mirror180` → `mirror270`；同置信度时顺序靠前者入选。
+> - 全部候选都未通过载荷校验时 `detected=false`、`selected=null`。
+> - 多个有效候选恢复出不同文本时 `conflict=true`，`conflict_texts` 去重列出
+>   各候选文本；顶层 `text` 仍是最佳候选文本，但它不代表唯一结论。
+> - 入选方向的失真标注图已**逆变换回上传图坐标**；检测输入快照保存的仍是
+>   **未转正的上传原图**。
 
 隐私检查响应（节选；缺失字段为 `null`，前端显示「无」）：
 
@@ -293,6 +365,11 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 （`$WM_DATA_DIR/reports/`、`$WM_DATA_DIR/archive.log.jsonl`）随之持久化，
 升级镜像后仍可下载与校验，Docker Compose 启动方式不变。
 
+> 自动方向检索为页面/接口上的**可选模式**，无需额外环境变量、不改变
+> Docker Compose 一条命令启动方式（`docker compose up -d --build`，访问
+> http://localhost:8000 ）；它在内存中把检测重复 8 次，不产生额外配置与文件，
+> 方向候选摘要随检测记录与报告一起归档。
+
 ### 嵌入参数（在 `app/dctwm.py` 顶部调整）
 
 | 参数 | 含义 |
@@ -319,9 +396,10 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 │       ├── style.css
 │       └── app.js
 ├── tests/
-│   ├── test_core.py      # 核心算法数值验证（DCT/PN/鲁棒性全链路）
-│   ├── test_privacy.py   # 隐私检查接口：EXIF 解析 / DMS 还原 / 缺失与损坏 / 不落盘不阻断
-│   └── test_reports.py   # 报告归档接口与清单/哈希链校验（篡改、缺失、断链）
+│   ├── test_core.py        # 核心算法数值验证（DCT/PN/鲁棒性全链路）
+│   ├── test_orientation.py # 自动方向检索：8 方向恢复 / 校验筛选 / 同分取舍 / 冲突 / 标注逆变换 / API+归档
+│   ├── test_privacy.py     # 隐私检查接口：EXIF 解析 / DMS 还原 / 缺失与损坏 / 不落盘不阻断
+│   └── test_reports.py     # 报告归档接口与清单/哈希链校验（篡改、缺失、断链）
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -332,7 +410,7 @@ compose 默认把数据目录持久化到命名卷 `wm-data`；归档报告与�
 
 ```bash
 python3 tests/test_core.py
-python3 -m pytest tests/test_reports.py tests/test_privacy.py -q   # 归档 + 隐私检查接口测试
+python3 -m pytest tests/test_reports.py tests/test_privacy.py tests/test_orientation.py -q
 ```
 
 数据目录布局（`WM_DATA_DIR`）：

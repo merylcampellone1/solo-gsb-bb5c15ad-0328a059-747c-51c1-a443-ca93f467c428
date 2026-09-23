@@ -97,6 +97,17 @@
         <span>待检测图片</span>
         <input type="file" id="detect-file" accept="image/png,image/jpeg,image/webp,image/bmp" />
       </label>
+      <div class="field">
+        <span>检测模式</span>
+        <div class="seg" id="orient-seg">
+          <button type="button" data-value="off" class="on">普通检测（原向）</button>
+          <button type="button" data-value="auto">自动方向检索（8 方向）</button>
+        </div>
+        <small class="muted">
+          自动模式对原向 / 90° / 180° / 270° 及各自水平镜像逐一检测，仅采信通过载荷校验的结果；
+          耗时约为普通检测的 8 倍。
+        </small>
+      </div>
       <button class="primary" id="btn-detect-upload">检测上传图片</button>
       <div class="status" id="detect-upload-status"></div>
     </section>
@@ -172,6 +183,12 @@
       <div class="recovered">
         <span>恢复文本</span>
         <code id="detect-text">—</code>
+      </div>
+
+      <div id="orientation-box" class="orientation-box hidden">
+        <div id="orientation-verdict"></div>
+        <div id="orientation-conflict" class="orientation-conflict hidden"></div>
+        <div class="orientation-cands" id="orientation-cands"></div>
       </div>
 
       <h3>置信度</h3>

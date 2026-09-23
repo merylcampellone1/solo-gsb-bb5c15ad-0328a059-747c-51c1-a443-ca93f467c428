@@ -14,6 +14,10 @@
   再把所有瓦片相同位置的载荷块投票合并（跨瓦片多数表决）。
 * 码流 = 魔数(0xAB) + 载荷长度 + UTF-8 文本 + 校验和；检测端按长度假设
   从大到小扫描，魔数与校验同时通过才采信。
+* 独立上传检测可选“自动方向检索”：对原向 / 90 / 180 / 270 度及各自水平镜像
+  共 8 个方向分别执行上述检测，仅通过载荷校验的方向有效；按置信度（同分按
+  固定顺序）选出入射方向，候选文本不一致时标记冲突；入选方向的失真标注图
+  经逆刚体变换映射回上传图坐标（见 detect_watermark_multi_orientation）。
 """
 
 from __future__ import annotations
@@ -48,6 +52,25 @@ PAIR_B = ((4, 1), (1, 4))
 # 码流结构
 MAGIC = 0xAB
 STREAM_FIXED_BYTES = 3          # magic + length + checksum
+
+# ---------------------------------------------------------------- 方向检索
+#
+# 独立上传的图片可能经历过旋转 / 镜像（截屏转发、编辑软件另存等）。
+# 检测端不假定上传图就是嵌入时的方向，而是对 8 个正交方向（D4 二面体群：
+# 原向、90/180/270 度旋转，以及各自的水平镜像）逐一运行现有水印检测，
+# 仅采信通过魔数 + 校验和载荷校验（detected=True）的候选。
+
+# (内部 ID, 展示名)；顺序即置信度同分时的固定取舍优先级（原向优先）
+ORIENTATIONS: list[tuple[str, str]] = [
+    ("original",      "原向"),
+    ("rotate90",      "顺时针 90°"),
+    ("rotate180",     "180°"),
+    ("rotate270",     "逆时针 90°（顺时针 270°）"),
+    ("mirror",        "水平镜像"),
+    ("mirror90",      "水平镜像 + 顺时针 90°"),
+    ("mirror180",     "水平镜像 + 180°"),
+    ("mirror270",     "水平镜像 + 逆时针 90°"),
+]
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -607,6 +630,168 @@ def _render_overlay(
         if x < w:
             out[:gh * BLK, max(x - 1, 0):x + 1] = (70, 150, 255)
     return out
+
+
+# ---------------------------------------------------------------- 多方向检索
+
+def _cw_k(orientation: str) -> int:
+    """方向 ID -> （先水平镜像后）顺时针旋转的 90° 次数（0~3）。"""
+    return {
+        "original": 0, "rotate90": 1, "rotate180": 2, "rotate270": 3,
+        "mirror": 0, "mirror90": 1, "mirror180": 2, "mirror270": 3,
+    }[orientation]
+
+
+def apply_orientation(rgb: np.ndarray, orientation: str) -> np.ndarray:
+    """上传图坐标 -> 该方向检测坐标：先水平镜像（可选），再顺时针旋转。"""
+    out = rgb
+    if orientation.startswith("mirror"):
+        out = out[:, ::-1, :]                       # 水平镜像（左/右翻转）
+    k = _cw_k(orientation)
+    if k:
+        # np.rot90 的 k 为逆时针次数；顺时针 k 次 = 逆时针 (4-k) 次
+        out = np.rot90(out, k=(4 - k) % 4, axes=(0, 1))
+    return np.ascontiguousarray(out)
+
+
+def invert_orientation(im: np.ndarray, orientation: str) -> np.ndarray:
+    """方向检测坐标 -> 上传图坐标（apply_orientation 的逆变换）。
+
+    对入选方向的失真标注图使用：先逆时针转回，再做水平镜像。
+    """
+    out = im
+    k = _cw_k(orientation)
+    if k:
+        out = np.rot90(out, k=k, axes=(0, 1))      # 逆时针 k 次
+    if orientation.startswith("mirror"):
+        out = out[:, ::-1, :]
+    return np.ascontiguousarray(out)
+
+
+@dataclass
+class OrientationCandidate:
+    orientation: str
+    label: str
+    detected: bool
+    confidence: float = 0.0
+    text: str = ""
+    sync_score: float = 0.0
+    sync_agreement: float = 0.0
+    reason: str = ""
+    result: DetectResult | None = None
+
+
+@dataclass
+class OrientationSearchResult:
+    enabled: bool
+    selected: str | None = None                  # 入选方向 ID（无有效候选时为 None）
+    selected_label: str = ""
+    detected: bool = False                       # 是否存在通过载荷校验的候选
+    text: str = ""
+    confidence: float = 0.0
+    conflict: bool = False
+    conflict_texts: list[str] = field(default_factory=list)
+    candidates: list[OrientationCandidate] = field(default_factory=list)
+    result: DetectResult | None = None           # 入选方向的检测结果（overlay 已逆变换）
+    reason: str = ""
+
+
+def _candidate_summary(c: OrientationCandidate) -> dict:
+    """候选摘要（写入检测记录 / 报告，JSON 可序列化，不含图片）。"""
+    return {
+        "orientation": c.orientation,
+        "label": c.label,
+        "detected": c.detected,
+        "confidence": c.confidence,
+        "text": c.text,
+        "sync_score": c.sync_score,
+        "sync_agreement": c.sync_agreement,
+        "reason": c.reason,
+    }
+
+
+def select_orientation(candidates: list[OrientationCandidate]) -> tuple[
+        OrientationCandidate | None, list[OrientationCandidate], bool,
+        list[str]]:
+    """从候选中选出最佳方向。
+
+    仅 detected=True（通过魔数 + 校验和）的候选有效；按置信度取最大，
+    同分按 ORIENTATIONS 的固定顺序取舍。不同有效候选恢复出不同文本时
+    标记冲突并去重列出候选文本。
+
+    返回 (最佳候选, 有效候选列表, 是否冲突, 冲突文本列表)。
+    """
+    order = {oid: i for i, (oid, _) in enumerate(ORIENTATIONS)}
+    valid = [c for c in candidates if c.detected]
+    valid.sort(key=lambda c: (-c.confidence, order[c.orientation]))
+    best = valid[0] if valid else None
+
+    texts: list[str] = []
+    for c in valid:
+        if c.text not in texts:
+            texts.append(c.text)
+    conflict = len(texts) > 1
+    return best, valid, conflict, texts
+
+
+def detect_watermark_multi_orientation(
+    rgb: np.ndarray,
+    orientations: list[str] | None = None,
+) -> OrientationSearchResult:
+    """对多个方向逐一运行现有水印检测，仅采信通过载荷校验的候选。
+
+    入选方向的失真标注图会被逆变换回上传图坐标；本函数不修改入参，
+    原始检测输入快照由调用方按上传图原样保存。
+    """
+    ids = orientations or [oid for oid, _ in ORIENTATIONS]
+    candidates: list[OrientationCandidate] = []
+    for oid in ids:
+        label = dict(ORIENTATIONS)[oid]
+        warped = rgb if oid == "original" else apply_orientation(rgb, oid)
+        try:
+            r = detect_watermark(warped)
+        except WatermarkError as e:
+            candidates.append(OrientationCandidate(
+                orientation=oid, label=label, detected=False, reason=str(e)))
+            continue
+        c = OrientationCandidate(
+            orientation=oid, label=label, detected=r.detected,
+            confidence=r.confidence, text=r.text,
+            sync_score=r.sync_score, sync_agreement=r.sync_agreement,
+            reason=r.reason, result=r,
+        )
+        candidates.append(c)
+
+    best, valid, conflict, texts = select_orientation(candidates)
+    out = OrientationSearchResult(
+        enabled=True, candidates=candidates, conflict=conflict,
+        conflict_texts=texts,
+    )
+    if best is None:
+        out.reason = "八个方向均未通过载荷校验（魔数/校验和），图片可能未嵌入水印或已被严重破坏。"
+        return out
+
+    r = best.result
+    if r is not None and r.overlay is not None:
+        # 标注图逆变换回上传图坐标；未覆盖到的边缘像素（不足 8px）保持原图
+        marked_back = invert_orientation(r.overlay, best.orientation)
+        h, w = rgb.shape[:2]
+        overlay = rgb.copy()
+        mh, mw = marked_back.shape[:2]
+        overlay[:min(h, mh), :min(w, mw)] = marked_back[:h, :w]
+        r.overlay = overlay
+    out.selected = best.orientation
+    out.selected_label = best.label
+    out.detected = True
+    out.text = best.text
+    out.confidence = best.confidence
+    out.result = r
+    return out
+
+
+def orientation_summaries(res: OrientationSearchResult) -> list[dict]:
+    """候选摘要列表（供写入检测记录 / 报告 / API 响应）。"""
+    return [_candidate_summary(c) for c in res.candidates]
 
 
 # ---------------------------------------------------------------- PNG 编解码

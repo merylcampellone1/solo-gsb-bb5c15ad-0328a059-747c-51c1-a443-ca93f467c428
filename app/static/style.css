@@ -273,6 +273,82 @@ button.primary.subtle { margin-top: 12px; background: linear-gradient(135deg, #2
   word-break: break-all;
 }
 
+/* ---------- 自动方向检索结果 ---------- */
+.orientation-box {
+  margin: 10px 0 4px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.orientation-line { font-size: 13px; margin: 2px 0 8px; }
+.orientation-line.ok { color: #7ce8c8; }
+.orientation-line.fail { color: #ff9c9c; }
+.orientation-conflict {
+  font-size: 12px;
+  color: var(--warn);
+  background: rgba(240, 170, 40, 0.1);
+  border: 1px solid rgba(240, 170, 40, 0.4);
+  border-radius: 8px;
+  padding: 7px 10px;
+  margin-bottom: 8px;
+  word-break: break-all;
+}
+.orientation-conflict code {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 6px;
+  margin: 0 2px;
+  color: #ffd98a;
+}
+.orientation-cands {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 5px;
+}
+.orient-cand {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  grid-template-areas: "badge state conf" "badge text text";
+  gap: 1px 8px;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 5px 8px;
+  font-size: 11.5px;
+}
+.orient-cand.selected {
+  border-color: var(--accent-2);
+  box-shadow: 0 0 0 1px rgba(53, 208, 163, 0.35) inset;
+}
+.orient-cand.invalid { opacity: 0.55; }
+.orient-cand .oc-badge {
+  grid-area: badge;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 2px 7px;
+  font-weight: 600;
+  color: #b9c6dc;
+  white-space: nowrap;
+}
+.orient-cand.selected .oc-badge { border-color: var(--accent-2); color: #7ce8c8; }
+.orient-cand .oc-state { grid-area: state; color: var(--muted); font-size: 10.5px; }
+.orient-cand .oc-conf { grid-area: conf; text-align: right; font-variant-numeric: tabular-nums; color: var(--accent-2); }
+.orient-cand.invalid .oc-conf { color: var(--muted); }
+.orient-cand .oc-text {
+  grid-area: text;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #c5d0e2;
+}
+.orient-cand .oc-text small { color: var(--muted); }
+.orient-tag { color: #8fd8ff !important; }
+.orient-tag.conflict { color: var(--warn) !important; }
+
 .gauge-row { display: flex; justify-content: space-between; font-size: 12.5px; margin: 10px 0 4px; }
 .gauge-row b { font-variant-numeric: tabular-nums; }
 .bar {

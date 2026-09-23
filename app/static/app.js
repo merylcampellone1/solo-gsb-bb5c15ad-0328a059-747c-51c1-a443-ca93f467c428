@@ -14,6 +14,7 @@ const api = async (url, opts = {}) => {
 const state = {
   jobId: null,
   strength: "medium",
+  orientMode: "off",       // 独立检测：off=普通检测（原向），auto=自动方向检索
   originalUrl: null,
   watermarkedUrl: null,
   targetUrl: null,
@@ -29,6 +30,15 @@ $("#strength-seg").addEventListener("click", (e) => {
   if (!btn) return;
   state.strength = btn.dataset.value;
   document.querySelectorAll("#strength-seg button").forEach((b) =>
+    b.classList.toggle("on", b === btn)
+  );
+});
+
+$("#orient-seg").addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-value]");
+  if (!btn) return;
+  state.orientMode = btn.dataset.value;
+  document.querySelectorAll("#orient-seg button").forEach((b) =>
     b.classList.toggle("on", b === btn)
   );
 });
@@ -159,21 +169,36 @@ $("#btn-detect-upload").addEventListener("click", async () => {
   const file = $("#detect-file").files[0];
   const status = $("#detect-upload-status");
   if (!file) return fail(status, "请先选择待检测图片。");
-  await runDetect(file, null, "upload", status);
+  await runDetect(file, null, "upload", status,
+                  state.orientMode === "auto");
 });
 
 /* ---------------- 检测核心 ---------------- */
 
-async function runDetect(file, jobId, source, statusEl) {
+async function runDetect(file, jobId, source, statusEl, orientationSearch = false) {
   const status = statusEl || $("#attack-status");
-  busy(status, "正在执行 64 相移同步搜索与多数表决…");
+  busy(status, orientationSearch
+    ? "正在对 8 个方向执行同步搜索与多数表决（约为普通检测 8 倍耗时）…"
+    : "正在执行 64 相移同步搜索与多数表决…");
   const fd = new FormData();
   if (file) fd.append("image", file);
   if (jobId) fd.append("job_id", jobId);
+  if (orientationSearch) fd.append("orientation_search", "true");
   try {
     const r = await api("/api/detect", { method: "POST", body: fd });
     renderResult(r, source);
-    ok(status, r.detected ? "检测完成，水印已恢复。" : "检测完成，但未能恢复水印。");
+    if (orientationSearch && r.orientation_search && r.orientation_search.enabled) {
+      const os = r.orientation_search;
+      if (os.detected) {
+        ok(status, os.conflict
+          ? `检测完成：入选方向「${os.selected_label}」，但候选文本存在冲突，请查看方向结果。`
+          : `检测完成：水印位于「${os.selected_label}」方向，已恢复。`);
+      } else {
+        ok(status, "检测完成：8 个方向均未通过载荷校验。");
+      }
+    } else {
+      ok(status, r.detected ? "检测完成，水印已恢复。" : "检测完成，但未能恢复水印。");
+    }
   } catch (err) {
     fail(status, err.message);
   }
@@ -225,7 +250,62 @@ function renderResult(r, source) {
     switchTab("marked");
   }
 
+  renderOrientation(r.orientation_search);
   recordDetection(r);
+}
+
+/* ---------------- 自动方向检索结果 ---------------- */
+
+const ORIENT_BADGE = {
+  original: "原向", rotate90: "90°", rotate180: "180°", rotate270: "270°",
+  mirror: "镜像", mirror90: "镜像+90°", mirror180: "镜像+180°", mirror270: "镜像+270°",
+};
+
+function renderOrientation(os) {
+  const box = $("#orientation-box");
+  if (!os || !os.enabled) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+  const verdict = $("#orientation-verdict");
+  if (os.detected && os.selected) {
+    verdict.className = "orientation-line ok";
+    verdict.innerHTML =
+      `🧭 入选方向：<b>${escapeHtml(os.selected_label)}</b>` +
+      ` · 置信度 <b>${(os.confidence ?? 0).toFixed(1)}%</b>` +
+      `（共 ${(os.candidates || []).filter((c) => c.detected).length} 个方向通过载荷校验）`;
+  } else {
+    verdict.className = "orientation-line fail";
+    verdict.textContent = "🧭 8 个方向（原向 / 90° / 180° / 270° 及水平镜像）均未通过载荷校验。";
+  }
+
+  const conflict = $("#orientation-conflict");
+  if (os.conflict && (os.conflict_texts || []).length) {
+    conflict.classList.remove("hidden");
+    conflict.innerHTML =
+      "⚠ <b>方向候选冲突：</b>不同有效方向恢复出不同文本，最佳候选并非唯一结论，候选文本：" +
+      os.conflict_texts.map((t) => `<code>${escapeHtml(t)}</code>`).join("、");
+  } else {
+    conflict.classList.add("hidden");
+    conflict.textContent = "";
+  }
+
+  const list = $("#orientation-cands");
+  list.innerHTML = "";
+  (os.candidates || []).forEach((c) => {
+    const row = document.createElement("div");
+    row.className = "orient-cand"
+      + (c.orientation === os.selected ? " selected" : "")
+      + (c.detected ? "" : " invalid");
+    row.title = c.label;
+    row.innerHTML = `
+      <span class="oc-badge">${ORIENT_BADGE[c.orientation] || c.orientation}</span>
+      <span class="oc-state">${c.detected ? "✔ 校验通过" : "✘ 无效"}</span>
+      <span class="oc-conf">${c.detected ? `${(c.confidence ?? 0).toFixed(1)}%` : "—"}</span>
+      <span class="oc-text">${c.detected ? escapeHtml(c.text) : `<small>${escapeHtml(c.reason || "")}</small>`}</span>`;
+    list.appendChild(row);
+  });
 }
 
 /* ---------------- 检测报告归档 ---------------- */
@@ -253,6 +333,9 @@ function recordDetection(r) {
     confidence: r.metrics.confidence,
     at: r.detected_at_iso || r.detected_at,
     marked_det_url: r.marked_det_url,
+    orientation: (r.orientation_search && r.orientation_search.enabled)
+      ? { selected: r.orientation_search.selected_label, conflict: r.orientation_search.conflict }
+      : null,
     checked: true,
   });
   renderDetectList();
@@ -276,6 +359,7 @@ function renderDetectList() {
         <span class="det-main">
           <b>${escapeHtml(d.detected ? d.text : "未恢复水印")}</b>
           <small>${SOURCE_LABELS[d.source] || d.source} · 置信度 ${d.confidence ?? "—"}% · ${escapeHtml(time)}</small>
+          ${d.orientation ? `<small class="orient-tag ${d.orientation.conflict ? "conflict" : ""}">🧭 ${escapeHtml(d.orientation.selected || "8 方向均无效")}${d.orientation.conflict ? " · 候选冲突" : ""} · 自动方向检索</small>` : ""}
         </span>`;
       box.appendChild(label);
     });

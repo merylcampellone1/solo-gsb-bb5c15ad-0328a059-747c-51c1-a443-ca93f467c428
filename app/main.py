@@ -4,7 +4,9 @@
   GET  /                 前端页面
   POST /api/embed        上传图片 + 文本 -> 含水印 PNG
   POST /api/attack       对任务图片施加 JPEG 重压缩 / 中心裁切
-  POST /api/detect       上传图片或引用任务图片 -> 水印检测结果 + 失真叠加图
+  POST /api/detect       上传图片或引用任务图片 -> 水印检测结果 + 失真叠加图；
+                         独立上传可带 orientation_search=true 启用 8 方向自动检索
+                         （原向/90/180/270 + 各自水平镜像，仅采信通过载荷校验的候选）
   POST /api/privacy-check  上传 PNG/JPEG -> 只读解析 EXIF 拍摄时间/相机/GPS（不落盘、不建任务）
   GET  /api/jobs/{id}/{kind}  任务文件下载（original/watermarked/target/marked）
   GET  /api/jobs/{id}/detections/{det_id}/{kind}  某次检测的输入快照 / 标注图
@@ -39,7 +41,7 @@ MAX_UPLOAD_BYTES = 16 * 1024 * 1024
 MAX_DIM = 4096
 ALLOWED_KINDS = {"original", "watermarked", "target", "marked"}
 
-app = FastAPI(title="抗裁切水印实验台", version="1.1.0")
+app = FastAPI(title="抗裁切水印实验台", version="1.2.0")
 
 
 # ---------------------------------------------------------------- 任务存储
@@ -241,13 +243,28 @@ def attack(req: AttackRequest):
 async def detect(
     image: UploadFile | None = File(None),
     job_id: str | None = Form(None),
+    orientation_search: bool = Form(False),
 ):
     _ensure_data_dir()
     rgb, source = _resolve_image(image, job_id, prefer="target")
-    try:
-        res = wm.detect_watermark(rgb)
-    except wm.WatermarkError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+
+    # 自动方向检索仅用于独立上传检测：对 8 个方向（原向/90/180/270 及各自
+    # 水平镜像）运行现有水印检测，仅采信通过载荷校验的候选。引用任务图片
+    # 的普通检测仍按原流程（单方向）执行。
+    use_orientation = bool(orientation_search) and source == "uploaded"
+    om: wm.OrientationSearchResult | None = None
+    if use_orientation:
+        try:
+            om = wm.detect_watermark_multi_orientation(rgb)
+        except wm.WatermarkError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        res = om.result if om.result is not None else wm.DetectResult(
+            False, total_blocks=int(np.prod(rgb.shape[:2])), reason=om.reason)
+    else:
+        try:
+            res = wm.detect_watermark(rgb)
+        except wm.WatermarkError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     detection_id = "det_" + uuid.uuid4().hex[:12]
     detected_at, detected_at_iso = archive.utc_now()
@@ -303,6 +320,19 @@ async def detect(
         "marked_fraction": res.marked_fraction,
         "bit_confidences": res.bit_confidences,
     }
+    if use_orientation:
+        orientation_block = {
+            "enabled": True,
+            "selected": om.selected,
+            "selected_label": om.selected_label,
+            "detected": om.detected,
+            "conflict": om.conflict,
+            "conflict_texts": om.conflict_texts,
+            "candidates": wm.orientation_summaries(om),
+        }
+    else:
+        # 普通检测按原流程：不做方向枚举，方向字段显式标记为未启用
+        orientation_block = {"enabled": False}
     record = {
         "detection_id": detection_id,
         "job_id": job_id,
@@ -315,6 +345,7 @@ async def detect(
         "metrics": metrics,
         "attack_history": attack_history,
         "has_overlay": has_overlay,
+        "orientation_search": orientation_block,
     }
     (det_dir / f"{detection_id}.json").write_text(
         json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -330,6 +361,7 @@ async def detect(
         "text": res.text,
         "reason": res.reason,
         "metrics": metrics,
+        "orientation_search": orientation_block,
         "marked_url": marked_url,
         "marked_det_url": (
             f"/api/jobs/{job_id}/detections/{detection_id}/marked"

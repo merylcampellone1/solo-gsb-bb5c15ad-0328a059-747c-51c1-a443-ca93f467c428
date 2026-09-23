@@ -30,7 +30,7 @@ from fastapi import HTTPException
 
 REPORT_SCHEMA_VERSION = "1.0"
 GENERATOR_NAME = "wm-bench"
-GENERATOR_VERSION = "1.1.0"
+GENERATOR_VERSION = "1.2.0"
 MAX_REPORT_DETECTIONS = 20
 
 REPORT_ID_RE = re.compile(r"^rep_[0-9a-f]{12}$")
@@ -260,6 +260,8 @@ def create_report(data_dir: Path, job_id: str, detection_ids: list[str],
             "reason": rec.get("reason", ""),
             "confidence": rec.get("metrics", {}).get("confidence"),
             "metrics": rec.get("metrics", {}),
+            "orientation_search": rec.get("orientation_search",
+                                          {"enabled": False}),
             "attack_history": rec.get("attack_history", []),
             "references": refs,
         })
